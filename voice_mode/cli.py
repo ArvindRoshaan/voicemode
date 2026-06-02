@@ -1918,6 +1918,12 @@ Examples:
 @click.option('--audio-feedback/--no-audio-feedback', default=None, help='Enable/disable audio feedback')
 @click.option('--audio-format', help='Audio format (pcm, mp3, wav, flac, aac, opus)')
 @click.option('--disable-silence-detection', is_flag=True, help='Disable silence detection')
+@click.option('--manual-stop/--no-manual-stop', default=None,
+              help='End the turn yourself: only a keypress (or max duration) stops '
+                   'recording; VAD silence auto-stop is off, so pauses do not cut you off.')
+@click.option('--manual-stop-with-silence-detection/--no-manual-stop-with-silence-detection', default=None,
+              help='Like --manual-stop but keep VAD silence detection on: a keypress '
+                   'OR a silence pause ends recording, whichever comes first.')
 @click.option('--speed', type=float, help='Speech rate (0.25 to 4.0)')
 @click.option('--vad-aggressiveness', type=int, help='VAD aggressiveness (0-3)')
 @click.option('--skip-tts/--no-skip-tts', default=None, help='Skip TTS and only show text')
@@ -1926,7 +1932,7 @@ Examples:
 @click.option('--continuous', '-c', is_flag=True, help='Continuous conversation mode')
 def converse(message_args, message, wait, skip_stt, duration, min_duration, voice, tts_provider,
             tts_model, tts_instructions, audio_feedback, audio_format, disable_silence_detection,
-            speed, vad_aggressiveness, skip_tts, skip_conch, continuous):
+            manual_stop, manual_stop_with_silence_detection, speed, vad_aggressiveness, skip_tts, skip_conch, continuous):
     """Have a voice conversation directly from the command line.
 
     The MESSAGE to speak can be passed as a positional argument or via
@@ -2004,6 +2010,8 @@ def converse(message_args, message, wait, skip_stt, duration, min_duration, voic
                     chime_enabled=audio_feedback,
                     audio_format=audio_format,
                     disable_silence_detection=disable_silence_detection,
+                    manual_stop=manual_stop,
+                    manual_stop_with_silence_detection=manual_stop_with_silence_detection,
                     speed=speed,
                     vad_aggressiveness=vad_aggressiveness,
                     skip_tts=skip_tts,
@@ -2028,6 +2036,8 @@ def converse(message_args, message, wait, skip_stt, duration, min_duration, voic
                         chime_enabled=audio_feedback,
                         audio_format=audio_format,
                         disable_silence_detection=disable_silence_detection,
+                        manual_stop=manual_stop,
+                        manual_stop_with_silence_detection=manual_stop_with_silence_detection,
                         speed=speed,
                         vad_aggressiveness=vad_aggressiveness,
                         skip_tts=skip_tts,
@@ -2066,6 +2076,8 @@ def converse(message_args, message, wait, skip_stt, duration, min_duration, voic
                     chime_enabled=audio_feedback,
                     audio_format=audio_format,
                     disable_silence_detection=disable_silence_detection,
+                    manual_stop=manual_stop,
+                    manual_stop_with_silence_detection=manual_stop_with_silence_detection,
                     speed=speed,
                     vad_aggressiveness=vad_aggressiveness,
                     skip_tts=skip_tts,

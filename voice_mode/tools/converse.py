@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import time
+import threading
 import traceback
 from typing import Optional, Literal, Tuple, Dict, Union
 from pathlib import Path
@@ -350,6 +351,225 @@ def should_wait(text: str) -> bool:
 
 # Track last session end time for measuring AI thinking time
 last_session_end_time = None
+
+# Shared holder for the in-progress recording, used ONLY by the opt-in manual-stop
+# feature. The recording runs in a non-cancellable executor thread, so when ESC
+# raises CancelledError at the await boundary the thread's return value is lost.
+# To recover the partial audio, the recording thread publishes its growing chunk
+# list (by reference) and a stop Event here while recording; the converse
+# CancelledError handler reads them to transcribe what was captured. Guarded by a
+# lock; only populated when manual_stop is active so the default path is untouched.
+_manual_stop_lock = threading.Lock()
+_manual_stop_recording = {"chunks": None, "stop_event": None, "active": False}
+
+
+def _start_keypress_watcher(stop_event):
+    """Watch /dev/tty for Enter/Space and set stop_event when pressed.
+
+    This is the CLI surface of manual stop: in a real terminal the user presses a
+    key to end recording. We read /dev/tty directly (never sys.stdin, which is the
+    MCP JSON-RPC channel — reading it would corrupt the protocol). If there is no
+    controlling terminal (e.g. running as an MCP server, or headless), we return
+    None and the caller relies on the other stop feeders (ESC cancel, max_duration).
+
+    Returns a cleanup callable (restores terminal attrs, closes the fd) or None if
+    no usable /dev/tty was available.
+    """
+    import select
+    try:
+        import termios
+        import tty
+    except ImportError:
+        return None  # non-POSIX (e.g. Windows)
+
+    try:
+        tty_fd = os.open("/dev/tty", os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return None  # no controlling terminal
+
+    try:
+        old_attrs = termios.tcgetattr(tty_fd)
+    except termios.error:
+        os.close(tty_fd)
+        return None  # not a real tty (e.g. a pipe at /dev/tty)
+
+    done = threading.Event()
+
+    def _watch():
+        try:
+            tty.setcbreak(tty_fd)
+            while not done.is_set() and not stop_event.is_set():
+                r, _, _ = select.select([tty_fd], [], [], 0.1)
+                if r:
+                    try:
+                        ch = os.read(tty_fd, 1)
+                    except OSError:
+                        return
+                    # Enter (\r / \n) or Space ends recording; ignore other keys.
+                    if ch in (b"\r", b"\n", b" "):
+                        stop_event.set()
+                        return
+        finally:
+            try:
+                termios.tcsetattr(tty_fd, termios.TCSADRAIN, old_attrs)
+            except Exception:
+                pass
+
+    threading.Thread(target=_watch, name="manual-stop-keypress", daemon=True).start()
+
+    def cleanup():
+        done.set()
+        try:
+            termios.tcsetattr(tty_fd, termios.TCSADRAIN, old_attrs)
+        except Exception:
+            pass
+        try:
+            os.close(tty_fd)
+        except Exception:
+            pass
+
+    return cleanup
+
+
+def _manual_stop_transcribe_sync(transport: str) -> Optional[str]:
+    """Recover the partial recording after an ESC cancel and transcribe it.
+
+    SYNCHRONOUS by design, and run fire-and-forget on a dedicated worker thread
+    (see _run_manual_stop_transcribe). The converse cancel handler runs inside a
+    coroutine asyncio is actively cancelling, where *any* `await` (even shielded)
+    re-raises CancelledError immediately — verified in-chat. Running the recovery
+    on a plain thread escapes that; using `asyncio.run` here gives STT its own
+    fresh event loop fully detached from the cancelled task.
+
+    Reads the captured chunks, signals the recording thread to stop, concatenates,
+    and runs STT, then writes the transcript to MANUAL_STOP_TRANSCRIPT_FILE
+    (atomically) for the /get-transcript skill. Returns the text too (used by tests); the
+    converse handler ignores the return value and relies on the file.
+
+    Delivery is via the file, and recovery is now fire-and-forget, so /get-transcript can
+    run before this finishes. To avoid surfacing a STALE transcript in that
+    window, we BLANK the file at the start (once we know there's a real recording
+    to recover) and refill it atomically when STT completes — an early /get-transcript then
+    sees an empty file ("not ready") rather than the previous turn's text.
+    """
+    from voice_mode.config import MANUAL_STOP_TRANSCRIPT_FILE
+
+    with _manual_stop_lock:
+        chunks = _manual_stop_recording.get("chunks")
+        stop_event = _manual_stop_recording.get("stop_event")
+        active = _manual_stop_recording.get("active")
+
+    if not active or chunks is None:
+        return None  # no in-progress recording to recover (leave any prior file intact)
+
+    # Identity of the holder contents we're operating on, so our finally-cleanup
+    # doesn't wipe a newer recording's holder if a fresh converse started meanwhile.
+    my_chunks = chunks
+    my_stop_event = stop_event
+
+    def _write_transcript_atomic(text: str) -> None:
+        # Atomic: write a temp file in the same dir, then os.replace() — /get-transcript
+        # never sees a partial/half-written file.
+        import tempfile
+        MANUAL_STOP_TRANSCRIPT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(MANUAL_STOP_TRANSCRIPT_FILE.parent),
+                                   prefix=".get-transcript-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.replace(tmp, MANUAL_STOP_TRANSCRIPT_FILE)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    try:
+        # Blank the file now (we have a real recording to recover) so an early
+        # /get-transcript reports "not ready" instead of relaying the previous transcript.
+        try:
+            _write_transcript_atomic("")
+        except Exception as e:
+            logger.error(f"Manual-stop: failed to blank transcript file: {e}")
+
+        # Tell the recording thread to stop; give it a brief moment to flush the
+        # last chunk(s) and tear down the InputStream. Plain time.sleep — we're on
+        # a worker thread, not the event loop.
+        if stop_event is not None:
+            stop_event.set()
+        time.sleep(0.4)
+
+        captured = list(chunks)
+        if not captured:
+            return None  # cancelled before any audio was captured
+
+        try:
+            audio_data = np.concatenate(captured)
+        except ValueError:
+            return None
+        if len(audio_data) == 0:
+            return None
+
+        logger.info(f"⏹  Manual-stop: transcribing {len(audio_data)} samples captured before cancel")
+
+        # Run the async STT in this worker thread's own event loop.
+        async def _do_stt():
+            return await speech_to_text(
+                audio_data, SAVE_AUDIO, AUDIO_DIR if SAVE_AUDIO else None, transport
+            )
+
+        try:
+            stt_result = asyncio.run(_do_stt())
+        except Exception as e:
+            logger.error(f"Manual-stop transcription failed: {e}")
+            return None
+
+        if isinstance(stt_result, dict) and not stt_result.get("error"):
+            text = stt_result.get("text") or None
+            if text:
+                try:
+                    _write_transcript_atomic(text)
+                except Exception as e:
+                    logger.error(f"Manual-stop: failed to write transcript file: {e}")
+            return text
+        return None
+    finally:
+        # We own holder cleanup on the cancel path (the recording thread skips its
+        # own clear when the stop Event is set). Only clear if the holder STILL
+        # points at the same objects we operated on — otherwise a fresh converse
+        # repopulated it while we were transcribing and we must not wipe it.
+        with _manual_stop_lock:
+            if (_manual_stop_recording.get("chunks") is my_chunks
+                    and _manual_stop_recording.get("stop_event") is my_stop_event):
+                _manual_stop_recording["active"] = False
+                _manual_stop_recording["chunks"] = None
+                _manual_stop_recording["stop_event"] = None
+
+
+def _run_manual_stop_transcribe(transport: str) -> None:
+    """Launch manual-stop recovery on a detached daemon thread and return at once.
+
+    FIRE-AND-FORGET. The caller is the converse CancelledError handler, which runs
+    on the asyncio event-loop thread while the tool is being cancelled. We must NOT
+    block that thread: blocking it (e.g. join-ing the worker) starves the FastMCP
+    stdio transport for the STT duration and intermittently drops the connection
+    ("MCP error -32000: Connection closed") on slow transcription.
+
+    The worker (_manual_stop_transcribe_sync) does all the work — stop the
+    recording, transcribe on its own loop, and write the transcript file
+    atomically — so the result is delivered via the file (read by /get-transcript), NOT via
+    a return value (the harness discards a cancelled tool's return value anyway).
+    Running recovery on a thread is what escapes asyncio cancellation; we simply no
+    longer wait for it.
+    """
+    def _worker():
+        try:
+            _manual_stop_transcribe_sync(transport)
+        except Exception as e:  # never let the worker raise
+            logger.error(f"Manual-stop worker error: {e}")
+
+    threading.Thread(target=_worker, name="manual-stop-transcribe", daemon=True).start()
 
 # Initialize OpenAI clients - now using provider registry for endpoint discovery
 openai_clients = get_openai_clients(OPENAI_API_KEY or "dummy-key-for-local", None, None)
@@ -929,18 +1149,36 @@ def record_audio(duration: float) -> np.ndarray:
             sys.stderr = original_stderr
 
 
-def record_audio_with_silence_detection(max_duration: float, disable_silence_detection: bool = False, min_duration: float = 0.0, vad_aggressiveness: Optional[int] = None) -> Tuple[np.ndarray, bool]:
-    """Record audio from microphone with automatic silence detection.
-    
-    Uses WebRTC VAD to detect when the user stops speaking and automatically
-    stops recording after a configurable silence threshold.
-    
+def record_audio_with_silence_detection(max_duration: float, disable_silence_detection: bool = False, min_duration: float = 0.0, vad_aggressiveness: Optional[int] = None, manual_stop: bool = False) -> Tuple[np.ndarray, bool]:
+    """Record audio from the microphone via a streaming loop.
+
+    Despite the historical name, this is the project's *streaming* recorder:
+    audio is captured chunk-by-chunk in a loop, and recording stops on the FIRST
+    of several optional stop conditions:
+      - VAD silence  — when the user goes quiet (unless silence detection is
+        disabled; see below),
+      - keypress/ESC — when manual_stop is active and the converse handler signals
+        the shared stop Event (the audio captured so far is recoverable),
+      - max_duration — the hard ceiling.
+
+    Stop-condition matrix:
+      - silence on,  manual_stop off → classic VAD behavior.
+      - silence on,  manual_stop on  → VAD silence OR ESC, whichever first.
+      - silence off, manual_stop off → simple fixed-duration record_audio() path.
+      - silence off, manual_stop on  → "manual stop": ONLY ESC or max_duration ends
+        it (VAD silence-stop gated off, but the loop still runs so ESC works).
+
     Args:
-        max_duration: Maximum recording duration in seconds
-        disable_silence_detection: If True, disables silence detection and uses fixed duration recording
-        min_duration: Minimum recording duration before silence detection can stop (default: 0.0)
-        vad_aggressiveness: VAD aggressiveness level (0-3). If None, uses VAD_AGGRESSIVENESS from config
-        
+        max_duration: Maximum recording duration in seconds.
+        disable_silence_detection: If True, VAD silence does not stop recording.
+            On its own (no manual_stop) this uses the fixed-duration record_audio()
+            path; combined with manual_stop it yields the manual-stop mode above.
+        min_duration: Minimum recording duration before silence detection can stop.
+        vad_aggressiveness: VAD aggressiveness (0-3). If None, uses config default.
+        manual_stop: If True, publish the in-progress recording to the module-level
+            holder so the converse ESC handler can recover and transcribe the
+            partial audio if the tool is cancelled mid-recording.
+
     Returns:
         Tuple of (audio_data, speech_detected):
             - audio_data: Numpy array of recorded audio samples
@@ -954,15 +1192,25 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
         # For fallback, assume speech is present since we can't detect
         return (record_audio(max_duration), True)
     
-    if DISABLE_SILENCE_DETECTION or disable_silence_detection:
+    # When silence detection is disabled we normally use the simple fixed-duration
+    # record_audio() path. But that path never publishes the manual_stop holder, so an
+    # ESC press would find no audio to transcribe. When manual_stop is ALSO active
+    # ("manual stop") we instead run the streaming loop below with VAD's silence-stop
+    # decision gated off — so only ESC or max_duration ends the recording, and the
+    # holder is published so ESC recovery works.
+    silence_stop_disabled = bool(DISABLE_SILENCE_DETECTION or disable_silence_detection)
+    if silence_stop_disabled and not manual_stop:
         if disable_silence_detection:
             logger.info("Silence detection disabled for this interaction by request")
         else:
             logger.info("Silence detection disabled globally via VOICEMODE_DISABLE_SILENCE_DETECTION")
         # For fallback, assume speech is present since we can't detect
         return (record_audio(max_duration), True)
-    
-    logger.info(f"🎤 Recording with silence detection (max {max_duration}s)...")
+
+    if silence_stop_disabled and manual_stop:
+        logger.info(f"🎤 Recording in manual-stop mode (VAD silence-stop off; ESC or max {max_duration}s)...")
+    else:
+        logger.info(f"🎤 Recording with silence detection (max {max_duration}s)...")
     
     try:
         # Initialize VAD with provided aggressiveness or default
@@ -985,7 +1233,26 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
         recording_duration = 0
         speech_detected = False
         stop_recording = False
-        
+
+        # Manual stop: one stop Event, fed by two surfaces —
+        #   1. CLI keypress: a /dev/tty watcher sets it on Enter/Space.
+        #   2. Claude Code ESC: the converse CancelledError handler sets it (via the
+        #      shared holder) when recovering partial audio.
+        # The loop below polls this event; whichever feeder fires first stops it.
+        manual_stop_event = threading.Event() if manual_stop else None
+        keypress_cleanup = None
+        if manual_stop:
+            # Publish the chunk list (by reference) + stop Event so the ESC handler
+            # can recover partial audio on cancel.
+            with _manual_stop_lock:
+                _manual_stop_recording["chunks"] = chunks
+                _manual_stop_recording["stop_event"] = manual_stop_event
+                _manual_stop_recording["active"] = True
+            # CLI surface: if a controlling terminal exists, let a keypress stop it.
+            keypress_cleanup = _start_keypress_watcher(manual_stop_event)
+            if keypress_cleanup is not None:
+                logger.info("⌨️  Manual stop: press Enter or Space to stop recording")
+
         # Use a queue for thread-safe communication
         import queue
         audio_queue = queue.Queue()
@@ -1037,6 +1304,12 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                 logger.debug("Started continuous audio stream")
                 
                 while recording_duration < max_duration and not stop_recording:
+                    # Manual-stop: a feeder (keypress watcher or ESC handler) sets this on stop so
+                    # the recording thread exits cleanly with the captured chunks.
+                    if manual_stop_event is not None and manual_stop_event.is_set():
+                        logger.info(f"⏹  Manual stop signalled (keypress or ESC) — ending recording after {recording_duration:.1f}s")
+                        stop_recording = True
+                        break
                     try:
                         # Get audio chunk from queue with timeout
                         chunk = audio_queue.get(timeout=0.1)
@@ -1099,8 +1372,12 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                                 
                                 # Check if we should stop due to silence threshold
                                 # Use the larger of MIN_RECORDING_DURATION (global) or min_duration (parameter)
+                                # In manual-stop mode (silence_stop_disabled + manual_stop) VAD silence
+                                # never ends the recording — only ESC or max_duration does.
                                 effective_min_duration = max(MIN_RECORDING_DURATION, min_duration)
-                                if recording_duration >= effective_min_duration and silence_duration_ms >= SILENCE_THRESHOLD_MS:
+                                if silence_stop_disabled:
+                                    pass  # VAD silence-stop gated off (manual stop)
+                                elif recording_duration >= effective_min_duration and silence_duration_ms >= SILENCE_THRESHOLD_MS:
                                     logger.info(f"✓ Silence threshold reached after {recording_duration:.1f}s of recording")
                                     if VAD_DEBUG:
                                         logger.info(f"[VAD_DEBUG] STOP: silence_duration={silence_duration_ms}ms >= threshold={SILENCE_THRESHOLD_MS}ms")
@@ -1180,9 +1457,14 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                     import time as time_module
                     time_module.sleep(0.5)
                     
-                    # Try recording again with the new device (recursive call in sync context)
+                    # Try recording again with the new device (recursive call in sync context).
+                    # Tear down this call's keypress watcher first so the retry can
+                    # cleanly re-establish its own on /dev/tty (avoid two cbreak watchers).
+                    if keypress_cleanup is not None:
+                        keypress_cleanup()
+                        keypress_cleanup = None
                     logger.info("Retrying recording with new audio device...")
-                    return record_audio_with_silence_detection(max_duration, disable_silence_detection, min_duration, vad_aggressiveness)
+                    return record_audio_with_silence_detection(max_duration, disable_silence_detection, min_duration, vad_aggressiveness, manual_stop)
                     
                 except Exception as reinit_error:
                     logger.error(f"Failed to reinitialize audio: {reinit_error}")
@@ -1197,6 +1479,9 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
             return (record_audio(max_duration), True)
             
         finally:
+            # Tear down the CLI keypress watcher (restores /dev/tty terminal attrs).
+            if keypress_cleanup is not None:
+                keypress_cleanup()
             # Restore stdio
             if sys.stdin != original_stdin:
                 sys.stdin = original_stdin
@@ -1204,7 +1489,18 @@ def record_audio_with_silence_detection(max_duration: float, disable_silence_det
                 sys.stdout = original_stdout
             if sys.stderr != original_stderr:
                 sys.stderr = original_stderr
-    
+            # Clear the manual-stop holder so a later recording can't read stale
+            # chunks — BUT only on normal completion. If the stop Event is set, an
+            # ESC cancel is in flight and the converse handler still needs to read
+            # the captured chunks; clearing here would race it away (it would see
+            # active=False/chunks=None and return "Cancelled by user."). In that
+            # case the converse handler / _manual_stop_transcribe_sync owns the cleanup.
+            if manual_stop and (manual_stop_event is None or not manual_stop_event.is_set()):
+                with _manual_stop_lock:
+                    _manual_stop_recording["active"] = False
+                    _manual_stop_recording["chunks"] = None
+                    _manual_stop_recording["stop_event"] = None
+
     except Exception as e:
         logger.error(f"VAD initialization failed: {e}")
         logger.info("Falling back to fixed duration recording")
@@ -1225,6 +1521,8 @@ async def converse(
     chime_enabled: Optional[Union[bool, str]] = None,
     audio_format: Optional[str] = None,
     disable_silence_detection: Union[bool, str] = False,
+    manual_stop: Optional[Union[bool, str]] = None,
+    manual_stop_with_silence_detection: Optional[Union[bool, str]] = None,
     speed: Optional[float] = None,
     vad_aggressiveness: Optional[Union[int, str]] = None,
     skip_tts: Optional[Union[bool, str]] = None,
@@ -1272,6 +1570,14 @@ KEY PARAMETERS:
   Only used with a clone voice (abs-path clip or registered profile).
 • tts_provider ("openai"|"kokoro"): Provider selection (auto-selected unless specified)
 • disable_silence_detection (bool, default: false): Disable auto-stop on silence
+• manual_stop (bool, default: false): End the turn
+  yourself — recording stops ONLY when you press a key/ESC (transcribing what you
+  said) or at listen_duration_max. VAD silence auto-stop is OFF, so pauses don't
+  cut you off. In Claude Code, ESC ends it and the captured audio is surfaced via
+  the /get-transcript skill (the harness discards the cancelled tool's return value).
+• manual_stop_with_silence_detection (bool, default: false): Like manual_stop, but
+  VAD silence detection stays ON — recording ends on a key/ESC OR a silence pause,
+  whichever comes first. Use when you want a manual stop with auto-stop as a backstop.
 • vad_aggressiveness (0-3, default: 3): Voice detection strictness (0=permissive, 3=strict)
 • speed (0.25-4.0): Speech rate (1.0=normal, 2.0=double speed)
 • chime_enabled (bool): Enable/disable audio feedback chimes
@@ -1334,6 +1640,23 @@ consult the MCP resources listed above.
         wait_for_conch = wait_for_conch.lower() in ('true', '1', 'yes', 'on')
     if isinstance(skip_conch, str):
         skip_conch = skip_conch.lower() in ('true', '1', 'yes', 'on')
+    # Manual-stop controls — two intent-named booleans for "how does my turn end":
+    #   manual_stop                         -> only a keypress/ESC (or max_duration)
+    #                                          ends recording; VAD silence is OFF.
+    #   manual_stop_with_silence_detection  -> a keypress/ESC OR VAD silence ends it,
+    #                                          whichever comes first (VAD stays ON).
+    # Both enable "keystop" recovery: on ESC the audio captured so far is
+    # transcribed (via /get-transcript in Claude Code) instead of being discarded. When
+    # neither is set, behavior is the classic VAD/default (ESC = plain cancel).
+    if isinstance(manual_stop, str):
+        manual_stop = manual_stop.lower() in ('true', '1', 'yes', 'on')
+    if isinstance(manual_stop_with_silence_detection, str):
+        manual_stop_with_silence_detection = manual_stop_with_silence_detection.lower() in ('true', '1', 'yes', 'on')
+
+    keystop_enabled = bool(manual_stop or manual_stop_with_silence_detection)
+    # manual_stop (strict) also turns VAD silence-stop off.
+    if manual_stop:
+        disable_silence_detection = True
 
     # Resolve ref_text override once (path-vs-inline auto-detect). None means
     # "no override" — fall back to the resolved profile/sidecar transcript.
@@ -1419,7 +1742,7 @@ consult the MCP resources listed above.
     # Get event logger and start session
     event_logger = get_event_logger()
     session_id = None
-    
+
     # Check time since last session for AI thinking time
     global last_session_end_time
     current_time = time.time()
@@ -1701,7 +2024,7 @@ consult the MCP resources listed above.
                 record_start = time.perf_counter()
                 logger.debug(f"About to call record_audio_with_silence_detection with duration={listen_duration_max}, disable_silence_detection={disable_silence_detection}, min_duration={listen_duration_min}, vad_aggressiveness={vad_aggressiveness}")
                 audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
-                    None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness
+                    None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness, keystop_enabled
                 )
                 timings['record'] = time.perf_counter() - record_start
                 
@@ -1883,7 +2206,7 @@ consult the MCP resources listed above.
                         # Record audio
                         record_start = time.perf_counter()
                         audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
-                            None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness
+                            None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness, keystop_enabled
                         )
                         record_time = time.perf_counter() - record_start
                         timings['record'] = timings.get('record', 0) + record_time  # Accumulate timing
@@ -1939,7 +2262,7 @@ consult the MCP resources listed above.
                         # Record audio
                         record_start = time.perf_counter()
                         audio_data, speech_detected = await asyncio.get_event_loop().run_in_executor(
-                            None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness
+                            None, record_audio_with_silence_detection, listen_duration_max, disable_silence_detection, listen_duration_min, vad_aggressiveness, keystop_enabled
                         )
                         record_time = time.perf_counter() - record_start
                         timings['record'] = timings.get('record', 0) + record_time  # Accumulate timing
@@ -2160,6 +2483,16 @@ consult the MCP resources listed above.
                 "tool_name": "converse",
                 "reason": "client_cancel",
             })
+
+        # Manual-stop (opt-in): when ESC ends a manual-stop recording, transcribe
+        # the audio captured so far so the /get-transcript skill can surface it. Launched
+        # fire-and-forget on a detached thread (so we don't block the event loop /
+        # transport); the transcript is delivered via the file read by /get-transcript, not
+        # this return value (the harness discards a cancelled tool's return value).
+        if keystop_enabled:
+            logger.info("⏹  Manual-stop: ESC cancel — recovering captured audio in background (use /get-transcript)")
+            _run_manual_stop_transcribe(transport)
+
         result = "Cancelled by user."
         success = False
         return result

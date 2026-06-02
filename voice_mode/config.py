@@ -746,6 +746,12 @@ MIN_RECORDING_DURATION = float(os.getenv("VOICEMODE_MIN_RECORDING_DURATION", "0.
 VAD_CHUNK_DURATION_MS = 30  # VAD frame size (must be 10, 20, or 30ms)
 INITIAL_SILENCE_GRACE_PERIOD = float(os.getenv("VOICEMODE_INITIAL_SILENCE_GRACE_PERIOD", "1"))  # No initial silence grace period by default
 
+# Where the manual-stop transcript is written. The Claude Code harness discards a
+# cancelled tool's return value, so the transcript can't be delivered in-chat via
+# the return. Instead it's written here; the `/get-transcript` skill reads it and submits
+# it as the user's turn. Overwritten on each manual-stop ESC; never auto-cleared.
+MANUAL_STOP_TRANSCRIPT_FILE = BASE_DIR / "last_esc_transcript.txt"
+
 # Default listen duration for converse tool
 DEFAULT_LISTEN_DURATION = float(os.getenv("VOICEMODE_DEFAULT_LISTEN_DURATION", "120.0"))  # Default 120s listening time
 
